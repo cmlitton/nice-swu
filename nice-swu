@@ -1,0 +1,194 @@
+#!/bin/bash
+#
+# my version of https://www.jamf.com/jamf-nation/discussions/28280/a-nicer-software-update-tool
+#
+###
+#
+#            Name:  SWUpdateNice.sh
+#     Description:  This script, meant to be triggered every Thursday if updates
+#                   are detected by 'softwareupdate' require a re-start. Users are
+#                   given a countdown to choose the option to re-start or deferral
+#                   the update until 4:30PM EST.
+#                   A LaunchAgent is used to trigger the update at 4:30PM EST. The
+#                   the user will be required to restart at that time.
+#
+#          Author:  Michael Litton <thelittons@mac.com>
+#         Created:  2017-12-18
+#   Last Modified:  2017-12-18
+#         Version:  1.0
+#
+#   Derived from : Elliot Jordan <elliot@elliotjordan.com> - install_or_defer.sh
+#                : https://github.com/homebysix/install-or-defer
+#                : Christopher <Taboc741>
+#                : https://www.jamf.com/jamf-nation/discussions/28280/a-nicer-software-update-tool
+###
+#
+############################### VARIABLES ######################################
+
+OSVERSION=$(sw_vers -productVersion)                   # determine OS versions
+LOGGEDINUSER=$(who | grep console | awk '{print $1}')  # who is current user
+JAMFHELPER="/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper"
+
+# Check for updates that require a restart and ones that do not.
+SWU_NO_RESTART=$(softwareupdate -l | grep recommended | grep -v restart)
+SWU_RESTART=$(softwareupdate -l | grep restart | grep -v '\*' | cut -d , -f 1)
+SWU_SHUTDOWN=$(softwareupdate -l | grep shutdown | grep -v '\*' | cut -d , -f 1)
+
+# Logging
+LOG_PATH="/tmp/log"
+LOG_FILE="/tmp/log/swupdatenice.log"
+
+
+
+########################## FILE PATHS AND IDENTIFIERS #########################
+
+# Path to a plist file that is used to store settings locally.
+# Omit ".plist" extension.
+# PLIST="/Library/Preferences/com.swu.install_or_defer"
+
+# The identifier of the LaunchAgent that is used to call this script. Omit "
+# Omit ".plist" extension.
+# BUNDLE_ID="com.swu.install_or_defer"
+
+############################## FUNCTIONS #######################################
+
+# Send echo to log file
+sendtolog (){
+echo "$(date +"%Y-%b-%d %T") : $1" | tee -a "$LOG_FILE"
+}
+
+# decaffeinate and exit
+cleanexit(){
+    /bin/kill "${caffeinatePID}"
+    exit "$1"
+}
+
+restart_later(){
+# Create the LaunchDaemon
+cat << EOF > "/Library/LaunchDaemons/com.restart.plist"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.restart</string>
+    <key>Program</key>
+    <string>/private/tmp/restart.sh</string>
+    <key>StartCalendarInterval</key>
+    <array>
+      <dict>
+        <key>Hour</key>
+        <integer>17</integer>
+        <key>Minute</key>
+  			<integer>30</integer>
+      </dict>
+    </array>
+  </dict>
+</plist>
+EOF
+
+sendtolog "plist made"
+
+# Create a jamfHelper script that will be called by a LaunchDaemon.
+cat << EOF > "/private/tmp/restart.sh"
+            #!/bin/bash
+            "/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper" \
+            -windowType hud \
+            -title "IT Department" \
+            -heading "Computer Reboot required" \
+            -alignHeading left \
+            -description "This computer will now reboot in 2 minutes" \
+            -alignDescription left \
+            -icon '/System/Library/CoreServices/Install Command Line Developer Tools.app/Contents/Resources/SoftwareUpdate.icns' \
+            -iconSize 64 \
+            -timeout 600 \
+            -countdown \
+            -lockHUD
+EOF
+
+sendtolog "script made"
+
+# Give permissions
+        chmod 755 "/private/tmp/deferrestart.sh"
+        chmod 644 "/Library/LaunchDaemons/com.restart.plist"
+
+
+}
+
+clean_up(){
+# unload LaunchDaemon
+        launchctl unload -w "/Library/LaunchDaemons/com.restart.plist"
+# move LaunchDaemon
+        mv "/Library/LaunchDaemons/com.restart.plist" "/private/tmp/com.restart.plist"
+# remove the LaunchDaemon
+        rm -rf "/private/tmp/com.restart.plist"
+# exit
+        exit 0
+}
+
+############################# START ###########################################
+
+# Make folder and write the log file to it
+if [ ! -d "$LOG_PATH" ];then mkdir /tmp/log; fi
+#
+sendtolog "Beginning script"
+sendtolog "$LOGGEDINUSER is running $OSVERSION"
+sendtolog "SWU_NO_RESTART value is:$SWU_NO_RESTART"
+sendtolog "SWU_RESTART value is:$SWU_RESTART"
+sendtolog "SWU_SHUTDOWN value is: $SWU_SHUTDOWN"
+
+# Caffienate
+sendtolog "Begin caffeination"
+/usr/bin/caffeinate -dis &
+caffeinatePID=$!
+
+# If there are no software updates then recon and quit
+if [[ $SWU_NO_RESTART != "" && $SWU_RESTART = "" ]]; then
+  sendtolog "Only recommended software available, installing silently"
+  softwareupdate -i --recommended
+  sendtolog "Software downloads completed"
+  /usr/local/bin/jamf recon
+
+elif [[ $SWU_RESTART != "" || $SWU_SHUTDOWN != "" ]]; then
+  sendtolog "Beginning software downloads"
+  softwareupdate -i --all
+  sendtolog "Downloads complete, begin prompt"
+
+
+  RESULT=$("/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper" \
+  -windowType hud \
+  -title "IT Department" \
+  -heading "Computer Reboot required" \
+  -alignHeading left \
+  -description "This computer needs a reboot. If you select REBOOT it will begin immediately. If you select DEFER it will reboot at 4:30PM EST. There is no option to defer the 4:30 reboot. Please make your selelction within 2 minutes." \
+  -alignDescription left \
+  -icon '/System/Library/CoreServices/Install Command Line Developer Tools.app/Contents/Resources/SoftwareUpdate.icns' \
+  -iconSize 64 \
+  -button1 "REBOOT" \
+  -button2 "DEFER" \
+  -timeout 600 \
+  -countdown \
+  -lockHUD)
+
+
+      if [[ $RESULT == 0 ]]; then
+      # do button1 stuff
+          sendtolog "REBOOT selected"
+          shutdown -r now &
+
+
+      elif [[ $RESULT == 2 ]]; then
+      # do button2 stuff
+            sendtolog "DEFER selected"
+            restart_later
+            launchctl load -w "/Library/LaunchDaemons/com.restart.plist"
+
+
+
+
+# If you schedule a launchd job by setting the StartCalendarInterval key and the computer is asleep when the job should have run, your job will run when the computer wakes up. However, if the machine is off when the job should have run, the job does not execute until the next designated time occurs.
+
+      fi
+  fi
+
+  exit 0
